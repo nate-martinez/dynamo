@@ -35,6 +35,8 @@ from dynamo.llm import (
 )
 from dynamo.runtime import DistributedRuntime
 
+DEFAULT_NAMESPACE = "default"
+
 
 def validate_static_endpoint(value):
     """Validate that static-endpoint is three words separated by dots."""
@@ -111,6 +113,12 @@ def parse_args():
         dest="use_kv_events",
         help=" KV Router. Disable KV events.",
     )
+    parser.add_argument(
+        "--namespace",
+        type=str,
+        default=None,
+        help="Dynamo namespace for model discovery scoping. If specified, models will only be discovered from this namespace. If not specified, discovers models from all namespaces (global discovery).",
+    )
     parser.set_defaults(use_kv_events=True)
     parser.add_argument(
         "--router-replica-sync",
@@ -171,6 +179,16 @@ async def async_main():
 
     if flags.static_endpoint:
         kwargs["endpoint_id"] = flags.static_endpoint
+    else:
+        # For dynamic discovery, create an endpoint_id with the specified namespace
+        # This will be used by the HTTP service to determine which namespace to filter on
+        if flags.namespace:
+            # Specific namespace provided - use namespace-scoped discovery
+            kwargs["endpoint_id"] = f"{flags.namespace}.frontend.http"
+        else:
+            # No namespace provided - use default namespace "NS" for global discovery
+            kwargs["endpoint_id"] = "NS.frontend.http"
+
     if flags.model_name:
         kwargs["model_name"] = flags.model_name
     if flags.model_path:
@@ -183,6 +201,22 @@ async def async_main():
         # out=auto, most common
         engine_type = EngineType.Dynamic
     e = EntrypointArgs(engine_type, **kwargs)
+
+    # Log the discovery configuration for debugging
+    if is_static:
+        print(
+            f"Starting frontend in static mode with endpoint: {flags.static_endpoint}"
+        )
+    else:
+        if flags.namespace:
+            print(
+                f"Starting frontend with dynamic discovery scoped to namespace: '{flags.namespace}'"
+            )
+            print(f"Will only discover models from namespace: '{flags.namespace}'")
+        else:
+            print("Starting frontend with global dynamic discovery")
+            print("Will discover models from ALL namespaces")
+
     engine = await make_engine(runtime, e)
 
     try:

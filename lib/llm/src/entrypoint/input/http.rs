@@ -38,15 +38,37 @@ pub async fn run(runtime: Runtime, engine_config: EngineConfig) -> anyhow::Resul
                 Some(ref etcd_client) => {
                     let router_config = engine_config.local_model().router_config();
                     // Listen for models registering themselves in etcd, add them to HTTP service
-                    run_watcher(
-                        distributed_runtime,
-                        http_service.state().manager_clone(),
-                        etcd_client.clone(),
-                        MODEL_ROOT_PATH,
-                        router_config.router_mode,
-                        Some(router_config.kv_router_config),
-                    )
-                    .await?;
+                    // Check if we should filter by namespace (based on the local model's namespace)
+                    let local_namespace = &engine_config.local_model().endpoint_id().namespace;
+
+                    if local_namespace != "NS" && !local_namespace.is_empty() {
+                        // Use namespace-specific discovery if a specific namespace is configured
+                        tracing::info!("Using namespace-specific discovery for namespace: '{}'", local_namespace);
+                        tracing::info!("Will only discover models from namespace: '{}'", local_namespace);
+                        run_namespace_watcher(
+                            distributed_runtime,
+                            http_service.state().manager_clone(),
+                            etcd_client.clone(),
+                            MODEL_ROOT_PATH,
+                            local_namespace.clone(),
+                            router_config.router_mode,
+                            Some(router_config.kv_router_config),
+                        )
+                        .await?;
+                    } else {
+                        // Use global discovery when namespace is "NS", empty, or null
+                        tracing::info!("Using global model discovery (namespace: '{}')", local_namespace);
+                        tracing::info!("Will discover models from ALL namespaces");
+                        run_watcher(
+                            distributed_runtime,
+                            http_service.state().manager_clone(),
+                            etcd_client.clone(),
+                            MODEL_ROOT_PATH,
+                            router_config.router_mode,
+                            Some(router_config.kv_router_config),
+                        )
+                        .await?;
+                    }
                 }
                 None => {
                     // Static endpoints don't need discovery
@@ -147,6 +169,7 @@ pub async fn run(runtime: Runtime, engine_config: EngineConfig) -> anyhow::Resul
 
 /// Spawns a task that watches for new models in etcd at network_prefix,
 /// and registers them with the ModelManager so that the HTTP service can use them.
+/// This function discovers ALL models from ALL namespaces (global discovery).
 async fn run_watcher(
     runtime: DistributedRuntime,
     model_manager: Arc<ModelManager>,
@@ -161,6 +184,28 @@ async fn run_watcher(
     let (_prefix, _watcher, receiver) = models_watcher.dissolve();
     let _watcher_task = tokio::spawn(async move {
         watch_obj.watch(receiver).await;
+    });
+    Ok(())
+}
+
+/// Spawns a task that watches for new models in etcd for a specific namespace,
+/// and registers them with the ModelManager so that the HTTP service can use them.
+/// This function only discovers models from the specified target namespace.
+async fn run_namespace_watcher(
+    runtime: DistributedRuntime,
+    model_manager: Arc<ModelManager>,
+    etcd_client: etcd::Client,
+    network_prefix: &str,
+    target_namespace: String,
+    router_mode: RouterMode,
+    kv_router_config: Option<KvRouterConfig>,
+) -> anyhow::Result<()> {
+    let watch_obj = ModelWatcher::new(runtime, model_manager, router_mode, kv_router_config);
+    tracing::info!("Watching for remote models in namespace '{}' at {}", target_namespace, network_prefix);
+    let models_watcher = etcd_client.kv_get_and_watch_prefix(network_prefix).await?;
+    let (_prefix, _watcher, receiver) = models_watcher.dissolve();
+    let _watcher_task = tokio::spawn(async move {
+        watch_obj.watch_namespace_filtered(receiver, &target_namespace).await;
     });
     Ok(())
 }
