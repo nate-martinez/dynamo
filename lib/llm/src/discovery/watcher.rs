@@ -36,6 +36,7 @@ use crate::{
 };
 
 use super::{ModelEntry, ModelManager, MODEL_ROOT_PATH};
+use crate::namespace::is_global_namespace;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelUpdate {
@@ -87,8 +88,9 @@ impl ModelWatcher {
         }
     }
 
-    pub async fn watch(&self, mut events_rx: Receiver<WatchEvent>) {
-        tracing::debug!("model watcher started");
+    /// Common watch logic with optional namespace filtering
+    pub async fn watch(&self, mut events_rx: Receiver<WatchEvent>, target_namespace: Option<&str>) {
+        let global_namespace = target_namespace.map_or(true, is_global_namespace);
 
         while let Some(event) = events_rx.recv().await {
             match event {
@@ -107,6 +109,20 @@ impl ModelWatcher {
                             continue;
                         }
                     };
+
+                    // Filter by namespace if target_namespace is specified
+                    if let Some(target_ns) = target_namespace {
+                        if !global_namespace && model_entry.endpoint.namespace != target_ns {
+                            tracing::debug!(
+                                model_namespace = model_entry.endpoint.namespace,
+                                target_namespace = target_ns,
+                                model_name = model_entry.name,
+                                "Skipping model from different namespace"
+                            );
+                            continue;
+                        }
+                    }
+
                     let key = match kv.key_str() {
                         Ok(k) => k,
                         Err(err) => {
@@ -123,36 +139,84 @@ impl ModelWatcher {
                     }
 
                     if self.manager.has_model_any(&model_entry.name) {
-                        tracing::trace!(name = model_entry.name, "New endpoint for existing model");
+                        let trace_msg = if target_namespace.is_some() {
+                            "New endpoint for existing model in target namespace"
+                        } else {
+                            "New endpoint for existing model"
+                        };
+                        tracing::trace!(
+                            name = model_entry.name,
+                            namespace = model_entry.endpoint.namespace,
+                            trace_msg
+                        );
                         self.notify_on_model.notify_waiters();
                         continue;
                     }
 
+                    if target_namespace.is_some() {
+                        tracing::info!(
+                            model_name = model_entry.name,
+                            namespace = model_entry.endpoint.namespace,
+                            "Processing new model from target namespace"
+                        );
+                    }
+
                     match self.handle_put(&model_entry).await {
                         Ok(()) => {
-                            tracing::info!(model_name = model_entry.name, "added model");
+                            tracing::info!(
+                                model_name = model_entry.name,
+                                namespace = model_entry.endpoint.namespace,
+                                "added model"
+                            );
                             self.notify_on_model.notify_waiters();
                         }
                         Err(err) => {
                             tracing::error!(
                                 error = format!("{err:#}"),
-                                "error adding model {}",
-                                model_entry.name
+                                "error adding model {} from namespace {}",
+                                model_entry.name,
+                                model_entry.endpoint.namespace,
                             );
                         }
                     }
                 }
-                WatchEvent::Delete(kv) => match self.handle_delete(&kv).await {
-                    Ok(Some(model_name)) => {
-                        tracing::info!("removed model {}", model_name);
+                WatchEvent::Delete(kv) => {
+                    if let Some(target_ns) = target_namespace {
+                        let key = match kv.key_str() {
+                            Ok(k) => k,
+                            Err(err) => {
+                                tracing::error!(%err, ?kv, "Invalid UTF-8 string in model entry key, skipping delete");
+                                continue;
+                            }
+                        };
+
+                        // We don't need to check namespace for deletion since we're removing by key
+                        // But we log the namespace for debugging if we can parse the entry
+                        if let Ok(model_entry) = serde_json::from_slice::<ModelEntry>(kv.value()) {
+                            if global_namespace || model_entry.endpoint.namespace == target_ns {
+                                tracing::info!(
+                                    model_name = model_entry.name,
+                                    namespace = model_entry.endpoint.namespace,
+                                    "Model deleted from target namespace"
+                                );
+                            }
+                        }
+
+                        self.manager.remove_model_entry(key);
+                    } else {
+                        match self.handle_delete(&kv).await {
+                            Ok(Some(model_name)) => {
+                                tracing::info!("removed model {}", model_name);
+                            }
+                            Ok(None) => {
+                                // There are other instances running this model, nothing to do
+                            }
+                            Err(e) => {
+                                tracing::error!("error removing model: {}", e);
+                            }
+                        }
                     }
-                    Ok(None) => {
-                        // There are other instances running this model, nothing to do
-                    }
-                    Err(e) => {
-                        tracing::error!("error removing model: {}", e);
-                    }
-                },
+                }
             }
         }
     }
